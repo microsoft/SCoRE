@@ -1,0 +1,239 @@
+--- configs/spider/nl2code-bert.jsonnet	Sat Jul  4 19:02:18 2020
++++ configs/spider/nl2code-bert.jsonnet	Mon Aug 23 20:04:11 2021
+@@ -9,7 +9,7 @@
+     local bert_lr_s = '%0.1e' % args.bert_lr,
+     local end_lr_s = if args.end_lr == 0 then '0e0' else '%0.1e' % args.end_lr,
+ 
+-    local base_bert_enc_size = if args.bert_version == "bert-large-uncased-whole-word-masking" then 1024 else 768,
++    local base_bert_enc_size = if args.bert_version == "roberta-large" then 1024 else 768,
+     local enc_size =  base_bert_enc_size,
+ 
+     model_name: 'bs=%(bs)d,lr=%(lr)s,bert_lr=%(bert_lr)s,end_lr=%(end_lr)s,att=%(att)d' % (args + {
+@@ -107,4 +107,4 @@
+     log: {
+         reopen_to_flush: true,
+     }
+-}
++}
+\ No newline at end of file
+--- experiments/spider-bert-run.jsonnet	Fri Aug 14 18:02:57 2020
++++ experiments/spider-bert-run.jsonnet	Mon Aug 23 20:04:11 2021
+@@ -2,16 +2,16 @@
+     logdir: "logdir/bert_run",
+     model_config: "configs/spider/nl2code-bert.jsonnet",
+     model_config_args: {
+-        data_path: 'data/spider/',
+-        bs: 6,
+-        num_batch_accumulated: 4,
+-        bert_version: "bert-large-uncased-whole-word-masking",
++        data_path:'data/sparc_concat_q_contextbert_roberta/', #TODO(SCORE): change sparc or cosql data path
++        bs: 8,
++        num_batch_accumulated: 3,
++        bert_version: "roberta-large",
+         summarize_header: "avg",
+         use_column_type: false,
+         max_steps: 81000,
+         num_layers: 8,
+-        lr: 7.44e-4,
+-        bert_lr: 3e-6,
++        lr: 1e-4,
++        bert_lr: 1e-5,
+         att: 1,
+         end_lr: 0,
+         sc_link: true,
+@@ -28,6 +28,6 @@
+     eval_output: "__LOGDIR__/ie_dirs",
+     eval_beam_size: 1,
+     eval_use_heuristic: true,
+-    eval_steps: [ 1000 * x + 100 for x in std.range(30, 39)] + [40000],
++    eval_steps: [ 1000 * x + 100 for x in std.range(30, 39)] + [40000], #TODO(SCORE): change steps to be evaluated
+     eval_section: "val",
+-}
++}
+\ No newline at end of file
+--- ratsql/datasets/__init__.py	Sat Jul  4 14:32:58 2020
++++ ratsql/datasets/__init__.py	Mon Aug 23 20:04:11 2021
+@@ -1,2 +1,2 @@
+ from . import spider
+-from . import wikisql
++# from . import wikisql
+--- ratsql/models/spider/spider_enc.py	Fri Aug 14 19:11:20 2020
++++ ratsql/models/spider/spider_enc.py	Mon Aug 23 20:04:11 2021
+@@ -6,7 +6,7 @@
+ import attr
+ import numpy as np
+ import torch
+-from transformers import BertModel, BertTokenizer
++from transformers import RobertaModel, RobertaTokenizer, RobertaConfig
+ 
+ from ratsql.models import abstract_preproc
+ from ratsql.models.spider import spider_enc_modules
+@@ -19,6 +19,96 @@
+ from ratsql.utils import serialization
+ from ratsql.utils import vocab
+ 
++#TODO(SCORE): Change RoBERTa_PATH to your pre-trained SCoRe checkpoints
++RoBERTa_PATH = "../contextbert/contextbert_logs_checkpoints/augment_all_context_roberta/"
++
++def load_from_pretrained(model, state_dict):
++    # Convert old format to new format if needed from a PyTorch state_dict
++    old_keys = []
++    new_keys = []
++    for key in state_dict.keys():
++        new_key = None
++        if 'gamma' in key:
++            new_key = key.replace('gamma', 'weight')
++        if 'beta' in key:
++            new_key = key.replace('beta', 'bias')
++        if new_key:
++            old_keys.append(key)
++            new_keys.append(new_key)
++    for old_key, new_key in zip(old_keys, new_keys):
++        state_dict[new_key] = state_dict.pop(old_key)
++
++    # Load from a PyTorch state_dict
++    missing_keys = []
++    unexpected_keys = []
++    error_msgs = []
++    # copy state_dict so _load_from_state_dict can modify it
++    metadata = getattr(state_dict, '_metadata', None)
++    state_dict = state_dict.copy()
++    if metadata is not None:
++        state_dict._metadata = metadata
++
++    def load(module, prefix=''):
++        local_metadata = {} if metadata is None else metadata.get(prefix[:-1], {})
++        module._load_from_state_dict(
++            state_dict, prefix, local_metadata, True, missing_keys, unexpected_keys, error_msgs)
++        for name, child in module._modules.items():
++            if child is not None:
++                load(child, prefix + name + '.')
++
++    # Make sure we are able to load base models as well as derived models (with heads)
++    start_prefix = ''
++    model_to_load = model
++    start_prefix = model.base_model_prefix + '.'
++
++    load(model_to_load, prefix=start_prefix)
++    if len(missing_keys) > 0:
++        logger.info("Weights of {} not initialized from pretrained model: {}".format(
++            model.__class__.__name__, missing_keys))
++    if len(unexpected_keys) > 0:
++        logger.info("Weights from pretrained model not used in {}: {}".format(
++            model.__class__.__name__, unexpected_keys))
++    if len(error_msgs) > 0:
++        raise RuntimeError('Error(s) in loading state_dict for {}:\n\t{}'.format(
++                           model.__class__.__name__, "\n\t".join(error_msgs)))
++
++    if hasattr(model, 'tie_weights'):
++        model.tie_weights()  # make sure word embedding weights are still tied
++
++#     loading_info = {"missing_keys": missing_keys, "unexpected_keys": unexpected_keys, "error_msgs": error_msgs}
++
++    return model
++
++
++def get_tokenizer(model_path):
++
++    bert_config_file = os.path.join(model_path, f'config.json')
++    vocab_file = os.path.join(model_path, f'vocab.json')
++    merges_file = os.path.join(model_path, f'merges.txt')
++    print("ReLoad tokenizer.....")
++    bert_config = RobertaConfig.from_json_file(bert_config_file)
++    tokenizer = RobertaTokenizer(vocab_file=vocab_file, merges_file=merges_file, do_lower_case=True)
++
++    return tokenizer
++
++
++def get_bert(model_path):
++
++    bert_config_file = os.path.join(model_path, f'config.json')
++    vocab_file = os.path.join(model_path, f'vocab.json')
++    merges_file = os.path.join(model_path, f'merges.txt')
++    #TODO(SCORE): change pytorch_model_3.bin to the one you want to experiment with
++    init_checkpoint = os.path.join(model_path, f'pytorch_model_3.bin')
++
++    bert_config = RobertaConfig.from_json_file(bert_config_file)
++    model_bert = RobertaModel(bert_config)
++    state_dict = torch.load(init_checkpoint, map_location='cpu')
++    model_bert = load_from_pretrained(model_bert, state_dict)
++    print("Load pre-trained parameters.")
++    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++    model_bert.to(device)
++
++    return model_bert
+ 
+ @attr.s
+ class SpiderEncoderState:
+@@ -650,7 +727,7 @@
+             db_path,
+             fix_issue_16_primary_keys=False,
+             include_table_name_in_column=False,
+-            bert_version="bert-base-uncased",
++            bert_version = "roberta-base",
+             compute_sc_link=True,
+             compute_cv_link=False):
+ 
+@@ -661,13 +738,12 @@
+         self.include_table_name_in_column = include_table_name_in_column
+         self.compute_sc_link = compute_sc_link
+         self.compute_cv_link = compute_cv_link
++        self.bert_version = bert_version
+ 
+         self.counted_db_ids = set()
+         self.preprocessed_schemas = {}
+ 
+-        self.tokenizer = BertTokenizer.from_pretrained(bert_version)
+-
+-        # TODO: should get types from the data
++        self.tokenizer = RobertaTokenizer.from_pretrained(bert_version)
+         column_types = ["text", "number", "time", "boolean", "others"]
+         self.tokenizer.add_tokens([f"<type: {t}>" for t in column_types])
+ 
+@@ -745,7 +823,10 @@
+                     f.write(json.dumps(text) + '\n')
+ 
+     def load(self):
+-        self.tokenizer = BertTokenizer.from_pretrained(self.data_dir)
++#         self.tokenizer = RobertaTokenizer.from_pretrained(self.bert_version)
++#         self.tokenizer = get_tokenizer(RoBERTa_PATH)
++        self.tokenizer = RobertaTokenizer.from_pretrained(self.data_dir)
++
+ 
+ 
+ @registry.register('encoder', 'spider-bert')
+@@ -759,7 +841,7 @@
+             preproc,
+             update_config={},
+             bert_token_type=False,
+-            bert_version="bert-base-uncased",
++            bert_version="roberta-base",
+             summarize_header="first",
+             use_column_type=True,
+             include_in_memory=('question', 'column', 'table')):
+@@ -767,7 +849,7 @@
+         self._device = device
+         self.preproc = preproc
+         self.bert_token_type = bert_token_type
+-        self.base_enc_hidden_size = 1024 if bert_version == "bert-large-uncased-whole-word-masking" else 768
++        self.base_enc_hidden_size = 1024 if bert_version == "roberta-large" else 768
+ 
+         assert summarize_header in ["first", "avg"]
+         self.summarize_header = summarize_header
+@@ -791,7 +873,8 @@
+             sc_link=True,
+         )
+ 
+-        self.bert_model = BertModel.from_pretrained(bert_version)
++#         self.bert_model = RobertaModel.from_pretrained(bert_version)
++        self.bert_model = get_bert(RoBERTa_PATH)
+         self.tokenizer = self.preproc.tokenizer
+         self.bert_model.resize_token_embeddings(len(self.tokenizer))  # several tokens added
+ 
+@@ -1011,4 +1095,4 @@
+             assert first_sep_id > 0
+             _tok_type_list = [0] * (first_sep_id + 1) + [1] * (max_len - first_sep_id - 1)
+             tok_type_lists.append(_tok_type_list)
+-        return toks_ids, att_masks, tok_type_lists
++        return toks_ids, att_masks, tok_type_lists
+\ No newline at end of file

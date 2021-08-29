@@ -1,0 +1,116 @@
+--- run_dst.py	Sun May  2 22:04:11 2021
++++ run_dst.py	Mon Aug 23 18:07:44 2021
+@@ -142,7 +142,7 @@
+     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
+ 
+     for _ in train_iterator:
+-        epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
++        epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=True)
+ 
+         for step, batch in enumerate(epoch_iterator):
+             # If training is continued from a checkpoint, fast forward
+@@ -210,10 +210,22 @@
+                 break
+ 
+         if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
++            args.predict_type = 'dev' ####
+             results = evaluate(args, model_single_gpu, tokenizer, processor, prefix=global_step)
+             for key, value in results.items():
+                 tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
+ 
++            args.predict_type = 'test' ####
++            test_results = evaluate(args, model_single_gpu, tokenizer, processor, prefix=global_step)
++            
++            logger.info("\n================Dev and test results on epoch %s", str(step))
++            logger.info("Dev goal acc: {}".format(str(float(results["eval_accuracy_goal"]))))
++            logger.info("Dev loss: {}".format(str(float(results["loss"]))))
++            logger.info("Test goal acc: {}".format(str(float(test_results["eval_accuracy_goal"]))))
++            logger.info("Test loss: {}".format(str(float(test_results["loss"]))))
++            
++            args.predict_type = 'dev' ####
++
+         if args.max_steps > 0 and global_step > args.max_steps:
+             train_iterator.close()
+             break
+@@ -243,7 +255,7 @@
+     ds = {slot: 'none' for slot in model.slot_list}
+     with torch.no_grad():
+         diag_state = {slot: torch.tensor([0 for _ in range(args.eval_batch_size)]).to(args.device) for slot in model.slot_list}
+-    for batch in tqdm(eval_dataloader, desc="Evaluating"):
++    for batch in tqdm(eval_dataloader, desc="Evaluating", disable=True):
+         model.eval()
+         batch = batch_to_device(batch, args.device)
+ 
+@@ -439,7 +451,7 @@
+         torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
+ 
+     # Load data features from cache or dataset file
+-    cached_file = os.path.join(os.path.dirname(args.output_dir), 'cached_{}_features'.format(
++    cached_file = os.path.join(os.path.dirname(args.data_dir), 'cached_{}_features'.format(
+         args.predict_type if evaluate else 'train'))
+     if os.path.exists(cached_file) and not args.overwrite_cache: # and not output_examples:
+         logger.info("Loading features from cached file %s", cached_file)
+--- /dev/null	Wed Dec 31 16:00:00 1969
++++ run_example.sh	Mon Aug 23 18:07:44 2021
+@@ -0,0 +1,61 @@
++#!/bin/bash -x
++
++DATA_DIR="data/max_len_512_rp"
++pip install tensorboardX
++
++
++# BERTDIR="../contextbert/contextbert_logs_checkpoints/augment_multiwoz_mlm_dst_512_bert_base/pytorch_model_18.bin"
++BERTDIR="bert-base-uncased"
++
++LOGDIR="trippy_logs_checkpoints/bert_base_unccased"
++rm -r $LOGDIR
++mkdir $LOGDIR
++
++for step in train dev test; do
++    args_add=""
++    if [ "$step" = "train" ]; then
++	args_add="--do_train --predict_type=dummy"
++    elif [ "$step" = "dev" ] || [ "$step" = "test" ]; then
++	args_add="--do_eval --predict_type=${step}"
++    fi
++
++    python -u run_dst.py --task_name multiwoz21 \
++                      --data_dir $DATA_DIR/ \
++                      --dataset_config $DATA_DIR/multiwoz21.json \
++                      --model_type bert \
++                      --num_train_epochs 25 \
++                      --max_seq_length=512 \
++                      --per_gpu_eval_batch_size=1 \
++                      --logging_steps=10 \
++                      --warmup_proportion=0.1 \
++                      --label_value_repetitions \
++                      --eval_all_checkpoints \
++                      --adam_epsilon=1e-6 \
++                      --save_epochs 2 \
++                      --append_history \
++                      --use_history_labels \
++                      --delexicalize_sys_utts \
++                      --class_aux_feats_inform \
++                      --class_aux_feats_ds \
++                      --do_lower_case \
++                      --learning_rate=1e-4 \
++                      --per_gpu_train_batch_size=24 \
++                      --config_name bert-base-uncased \
++                      --tokenizer_name bert-base-uncased \
++                      --model_name_or_path $BERTDIR \
++                      --output_dir $LOGDIR/ \
++                      ${args_add} \
++                      2>&1 | tee $LOGDIR/${step}.log
++    
++    if [ "$step" = "dev" ] || [ "$step" = "test" ]; then
++    	python metric_bert_dst.py multiwoz21 $DATA_DIR/multiwoz21.json "$LOGDIR/pred_res.${step}*json" \
++    		2>&1 | tee $LOGDIR/eval_pred_${step}.log
++    fi
++    
++    if [ "$step" = "test" ]; then
++    	python metric_bert_dst_dir.py multiwoz21 $DATA_DIR/multiwoz21.json $LOGDIR 2>&1 | tee $LOGDIR/eval_dir_pred_all.log
++    fi
++    
++done
++                   
++
